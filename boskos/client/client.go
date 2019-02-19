@@ -81,10 +81,51 @@ func (c *Client) Acquire(rtype, state, dest string) (*common.Resource, error) {
 	return r, nil
 }
 
+// AcquireWithRetry invokes Acquire with retry logic. If the requested resource
+// is not found or unavailable, the request will be repeated until the number
+// of attempts exceeds the specified number of allowed retries.
+//
+// Please note that specifying retryCount=0 means at most one request will be
+// attempted. Specifying retryCount=1 means at most two requests will be sent,
+// the initial request and a single retry attempt.
+func (c *Client) AcquireWithRetry(rtype, state, dest string, retryCount uint, retryWait time.Duration) (*common.Resource, error) {
+	r, err := c.aquireWithRetry(rtype, state, dest, retryCount, retryWait)
+	if err != nil {
+		return nil, err
+	}
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if r != nil {
+		c.storage.Add(*r)
+	}
+
+	return r, nil
+}
+
 // AcquireByState asks boskos for a resources of certain type, and set the resource to dest state.
 // Returns a list of resources on success.
 func (c *Client) AcquireByState(state, dest string, names []string) ([]common.Resource, error) {
 	resources, err := c.acquireByState(state, dest, names)
+	if err != nil {
+		return nil, err
+	}
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	for _, r := range resources {
+		c.storage.Add(r)
+	}
+	return resources, nil
+}
+
+// AcquireByStateWithRetry invokes AcquireByState with retry logic. If the
+// requested resources are not found or unavailable, the request is repeated
+// until the number of attempts exceeds the specified number of allowed retries.
+//
+// Please note that specifying retryCount=0 means at most one request will be
+// attempted. Specifying retryCount=1 means at most two requests will be sent,
+// the initial request and a single retry attempt.
+func (c *Client) AcquireByStateWithRetry(state, dest string, names []string, retryCount uint, retryWait time.Duration) ([]common.Resource, error) {
+	resources, err := c.acquireByStateWithRetry(state, dest, names, retryCount, retryWait)
 	if err != nil {
 		return nil, err
 	}
@@ -247,7 +288,8 @@ func (c *Client) acquire(rtype, state, dest string) (*common.Resource, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			return nil, err
@@ -262,10 +304,36 @@ func (c *Client) acquire(rtype, state, dest string) (*common.Resource, error) {
 			return nil, fmt.Errorf("unable to parse resource")
 		}
 		return &res, nil
-	} else if resp.StatusCode == http.StatusNotFound {
+	case http.StatusUnauthorized:
+		return nil, ErrAlreadyInUse
+	case http.StatusNotFound:
 		return nil, ErrNotFound
 	}
 	return nil, fmt.Errorf("status %s, status code %v", resp.Status, resp.StatusCode)
+}
+
+func (c *Client) aquireWithRetry(rtype, state, dest string, retryCount uint, retryWait time.Duration) (*common.Resource, error) {
+	// Always bump the retryCount by 1 in order to equal the actual number of
+	// attempts. For example, if a retryCount of 2 is specified, the intent
+	// is for three attempts -- the initial attempt with two retries in case
+	// the initial attempt fails because the resource is already in use or
+	// not found.
+	retryCount++
+	i := uint(0)
+	for {
+		res, err := c.acquire(rtype, state, dest)
+		if err != nil {
+			if err == ErrAlreadyInUse || err == ErrNotFound {
+				if i < retryCount-1 {
+					i++
+					time.Sleep(retryWait)
+					continue
+				}
+			}
+			return nil, err
+		}
+		return res, nil
+	}
 }
 
 func (c *Client) acquireByState(state, dest string, names []string) ([]common.Resource, error) {
@@ -289,6 +357,30 @@ func (c *Client) acquireByState(state, dest string, names []string) ([]common.Re
 		return nil, ErrNotFound
 	}
 	return nil, fmt.Errorf("status %s, status code %v", resp.Status, resp.StatusCode)
+}
+
+func (c *Client) acquireByStateWithRetry(state, dest string, names []string, retryCount uint, retryWait time.Duration) ([]common.Resource, error) {
+	// Always bump the retryCount by 1 in order to equal the actual number of
+	// attempts. For example, if a retryCount of 2 is specified, the intent
+	// is for three attempts -- the initial attempt with two retries in case
+	// the initial attempt fails because the resource is already in use or
+	// not found.
+	retryCount++
+	i := uint(0)
+	for {
+		res, err := c.acquireByState(state, dest, names)
+		if err != nil {
+			if err == ErrAlreadyInUse || err == ErrNotFound {
+				if i < retryCount-1 {
+					i++
+					time.Sleep(retryWait)
+					continue
+				}
+			}
+			return nil, err
+		}
+		return res, nil
+	}
 }
 
 func (c *Client) release(name, dest string) error {
